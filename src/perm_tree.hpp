@@ -5,6 +5,7 @@
 #include <cassert>
 
 class PermTree {
+	// The tree is "left-associative": INCR/DECR nodes are structured as (1 INCR 2) INCR 3...
 public:
 	enum class NodeType {
 		LEAF,
@@ -29,7 +30,8 @@ public:
 
 	int size() const { return int(nodes.size()); }
 
-	PermTree(const std::vector<int>& A) : nodes(int(A.size())*2-1) {
+	PermTree(const std::vector<int>& A) : nodes(A.empty() ? 0 : int(A.size())*2-1) {
+		if (A.empty()) { root = -1; return; }
 		int N = int(A.size());
 		std::vector<int> nxt_earlier(N);
 		std::vector<int> prv_earlier(N);
