@@ -6,8 +6,9 @@ Overrides the competitive-verifier theme's toppage_body.html:
   a 🧪 marker instead of the not-verified warning icon.
 {%- endcomment -%}
 {%- if page.data.coverage -%}
-<h2><a href="{{ "/coverage/" | relative_url }}">Coverage</a></h2>
-{%- include coverage_summary.html coverage=page.data.coverage -%}
+<h2>Coverage</h2>
+{%- assign coverage_report_href = "/coverage/" | relative_url -%}
+{%- include coverage_summary.html coverage=page.data.coverage report_href=coverage_report_href -%}
 {%- endif -%}
 {%- for top in page.data.top -%}
 <h2>{{ top.type }}</h2>
