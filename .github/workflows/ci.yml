@@ -4,12 +4,27 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly full re-verify: scheduled runs skip the previous-results
+    # restore, so every solution is re-verified from scratch.
+    - cron: '0 5 * * 6'
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-and-test:
+  unit-tests:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -17,7 +32,7 @@ jobs:
           key: ${{ runner.os }}-ccache
 
       - name: Cache CMake dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/_deps
           key: ${{ runner.os }}-cmake-deps-${{ hashFiles('CMakeLists.txt') }}
@@ -30,3 +45,395 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  setup:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up competitive-verifier
+        uses: competitive-verifier/actions/setup@v2
+        with:
+          cache-pip: true
+
+      - name: oj-resolve
+        uses: competitive-verifier/actions/oj-resolve@v2
+        with:
+          output-path: verify_files.json
+          include: |
+            src
+            verify
+          exclude: |
+            third_party
+          config: .competitive-verifier/config.toml
+
+      - name: Bundle with library include path
+        run: python3 scripts/bundle.py --site verify_files.json
+
+      - name: Upload verify_files.json
+        uses: competitive-verifier/actions/upload-verify-artifact@v2
+        with:
+          file: verify_files.json
+
+      - name: Upload bundled
+        uses: actions/upload-artifact@v7
+        with:
+          name: Bundled-${{ runner.os }}
+          path: .competitive-verifier/bundled
+          retention-days: 1
+
+  verify:
+    runs-on: ubuntu-26.04
+    needs: [setup]
+    steps:
+      # Full history: the prev-results skip logic compares each file's
+      # last-commit time (git log -1) against the previous run's timestamps.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2147483647
+
+      - name: Download verify_files.json
+        uses: competitive-verifier/actions/download-verify-artifact@v2
+
+      - name: Set up competitive-verifier
+        uses: competitive-verifier/actions/setup@v2
+        with:
+          cache-pip: true
+
+      - name: Get library-checker-problems version
+        id: problems-version
+        run: |
+          echo "hash=$(git ls-remote https://github.com/yosupo06/library-checker-problems HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache testcases
+        uses: actions/cache@v6
+        with:
+          path: .competitive-verifier/cache
+          key: testcases-${{ steps.problems-version.outputs.hash }}-${{ hashFiles('verify/*.test.cpp') }}
+          restore-keys: |
+            testcases-${{ steps.problems-version.outputs.hash }}-
+            testcases-
+
+      - name: Restore previous results
+        uses: actions/cache/restore@v6
+        with:
+          path: .cv-prev-result
+          key: verify-result-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            verify-result-${{ github.ref }}-
+            verify-result-refs/heads/master-
+
+      - name: Check for previous result
+        id: prev-result
+        if: github.event_name != 'schedule'
+        run: |
+          if test -f .cv-prev-result/result.json; then
+            echo "file=.cv-prev-result/result.json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify
+        uses: competitive-verifier/actions/verify@v2
+        with:
+          destination: ${{ runner.temp }}/result.json
+          prev-result: ${{ steps.prev-result.outputs.file }}
+          timeout: 1800
+
+      - name: Save results for future runs
+        run: |
+          mkdir -p .cv-prev-result
+          cp "${{ runner.temp }}/result.json" .cv-prev-result/result.json
+
+      - name: Cache results
+        uses: actions/cache/save@v6
+        with:
+          path: .cv-prev-result
+          key: verify-result-${{ github.ref }}-${{ github.run_id }}
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Result-${{ runner.os }}
+          path: ${{ runner.temp }}/result.json
+          retention-days: 1
+
+  coverage-verify:
+    runs-on: ubuntu-26.04
+    steps:
+      # Full history: the prev-results skip logic compares each file's
+      # last-commit time (git log -1) against the previous run's timestamps.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2147483647
+
+      - name: Set up competitive-verifier
+        uses: competitive-verifier/actions/setup@v2
+        with:
+          cache-pip: true
+
+      # Rolling cache: testcases + coverage counters (interleaved in the
+      # per-problem dirs) + the previous result.json used to skip unchanged
+      # solutions. Skipped solutions keep their old .gcda counters; re-run
+      # solutions overwrite theirs in place.
+      - name: Restore coverage cache
+        id: coverage-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            .competitive-verifier/cache
+            .cv-coverage-result
+          key: coverage-cache-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            coverage-cache-${{ github.ref }}-
+            coverage-cache-refs/heads/master-
+
+      # Cold start: warm the testcase store from the verify job's cache.
+      - name: Restore testcases (cold start)
+        if: steps.coverage-cache.outputs.cache-matched-key == ''
+        uses: actions/cache/restore@v6
+        with:
+          path: .competitive-verifier/cache
+          key: testcases-
+          restore-keys: |
+            testcases-
+
+      - name: Check for previous result
+        id: prev-result
+        if: github.event_name != 'schedule'
+        run: |
+          if test -f .cv-coverage-result/result.json; then
+            echo "file=.cv-coverage-result/result.json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: oj-resolve (coverage environment)
+        uses: competitive-verifier/actions/oj-resolve@v2
+        with:
+          output-path: verify_files.json
+          include: |
+            src
+            verify
+          exclude: |
+            third_party
+          config: .competitive-verifier/config-coverage.toml
+
+      - name: Run verify solutions with coverage
+        uses: competitive-verifier/actions/verify@v2
+        with:
+          verify-files: verify_files.json
+          destination: ${{ runner.temp }}/coverage-result.json
+          prev-result: ${{ steps.prev-result.outputs.file }}
+          timeout: 1800
+
+      - name: Save results for future runs
+        run: |
+          mkdir -p .cv-coverage-result
+          cp "${{ runner.temp }}/coverage-result.json" .cv-coverage-result/result.json
+
+      - name: Save coverage cache
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            .competitive-verifier/cache
+            .cv-coverage-result
+          key: coverage-cache-${{ github.ref }}-${{ github.run_id }}
+
+      - name: Install gcovr
+        run: pipx install gcovr
+
+      - name: Generate coverage tracefile
+        run: |
+          gcovr --root . --filter 'src/' --exclude '.*\.test\.cpp' \
+            --gcov-ignore-parse-errors suspicious_hits.warn_once_per_file \
+            --exclude-lines-by-pattern '.*assert\(false\).*' \
+            --exclude-throw-branches --exclude-noncode-lines \
+            --json ${{ runner.temp }}/coverage-verify.json \
+            .competitive-verifier/cache
+
+      - name: Upload coverage tracefile
+        uses: actions/upload-artifact@v7
+        with:
+          name: CoverageTrace-verify
+          path: ${{ runner.temp }}/coverage-verify.json
+          retention-days: 1
+
+  coverage-unit-tests:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-ccache-coverage
+
+      - name: Cache CMake dependencies
+        uses: actions/cache@v6
+        with:
+          path: build/_deps
+          key: ${{ runner.os }}-cmake-deps-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Build and run unit tests with coverage
+        run: |
+          cmake -B build -DENABLE_COVERAGE=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+      # Never-run instrumented stubs so untouched headers appear in coverage
+      # denominators as 0% instead of being invisible (uninstantiated
+      # templates still can't be counted: they emit no code).
+      - name: Instrument untouched headers
+        run: |
+          mkdir -p coverage-stubs
+          for h in $(cd src && find . -name '*.hpp' | sed 's|^\./||'); do
+            stub="coverage-stubs/$(echo "$h" | tr '/' '_').cpp"
+            echo "#include \"$h\"" > "$stub"
+            ccache g++ --coverage -O0 -fkeep-inline-functions -std=c++26 -I src \
+              -c "$stub" -o "${stub%.cpp}.o" &
+          done
+          wait
+
+      - name: Install gcovr
+        run: pipx install gcovr
+
+      - name: Generate coverage tracefile
+        run: |
+          gcovr --root . --filter 'src/' --exclude '.*\.test\.cpp' \
+            --gcov-ignore-parse-errors suspicious_hits.warn_once_per_file \
+            --exclude-lines-by-pattern '.*assert\(false\).*' \
+            --exclude-throw-branches --exclude-noncode-lines \
+            --json ${{ runner.temp }}/coverage-unit-tests.json \
+            build coverage-stubs
+
+      - name: Upload coverage tracefile
+        uses: actions/upload-artifact@v7
+        with:
+          name: CoverageTrace-unit-tests
+          path: ${{ runner.temp }}/coverage-unit-tests.json
+          retention-days: 1
+
+  docs-and-check:
+    runs-on: ubuntu-26.04
+    needs: [verify, coverage-verify, coverage-unit-tests]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+      pull-requests: write
+    outputs:
+      upload-pages: ${{ steps.upload-pages.outcome == 'success' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2147483647
+
+      - name: Download verify_files.json and all artifacts
+        id: all-artifacts
+        uses: competitive-verifier/actions/download-verify-artifact@v2
+        with:
+          download-all: true
+          artifact-root: .artifacts/
+
+      - name: Extract bundled
+        shell: bash
+        run: |
+          rm -rf .competitive-verifier/bundled
+          if test -d "$SRCDIR"; then
+            mkdir -p .competitive-verifier/
+            mv "$SRCDIR" .competitive-verifier/bundled
+          else
+            echo "$SRCDIR does not exist."
+          fi
+        env:
+          SRCDIR: .artifacts/Bundled-${{ runner.os }}
+
+      - name: Set up competitive-verifier
+        uses: competitive-verifier/actions/setup@v2
+        with:
+          cache-pip: true
+
+      - name: Docs
+        uses: competitive-verifier/actions/docs@v2
+        with:
+          verify-result: ${{ steps.all-artifacts.outputs.artifacts-root }}/Result-*/result.json
+          destination: _jekyll
+          write-summary: true
+
+      - name: Install gcovr
+        run: pipx install gcovr
+
+      - name: Merge coverage reports
+        run: |
+          mkdir -p coverage
+          gcovr --root . \
+            --add-tracefile '${{ steps.all-artifacts.outputs.artifacts-root }}/CoverageTrace-*/coverage-*.json' \
+            --html-details coverage/index.html \
+            --cobertura coverage/coverage.xml \
+            --markdown-summary coverage/summary.md \
+            --json-summary coverage/summary.json \
+            --print-summary
+          cat coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write coverage badge
+        run: |
+          python3 - <<'EOF'
+          import json
+          s = json.load(open("coverage/summary.json"))
+          pct = s["line_percent"]
+          color = "brightgreen" if pct >= 90 else "green" if pct >= 75 else "yellow" if pct >= 50 else "red"
+          json.dump({
+              "schemaVersion": 1,
+              "label": "coverage",
+              "message": f"{pct:.1f}%",
+              "color": color,
+          }, open("coverage/badge.json", "w"))
+          EOF
+
+      - name: Add coverage sections to docs pages
+        run: python3 scripts/coverage_links.py --coverage-dir coverage --jekyll-dir _jekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v6
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: _jekyll
+          destination: _site
+
+      - name: Add coverage report to site
+        run: sudo cp -r coverage _site/coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: Coverage-${{ runner.os }}
+          path: coverage/
+          retention-days: 7
+
+      - name: Comment coverage on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: coverage
+          path: coverage/summary.md
+
+      - name: Upload artifact
+        id: upload-pages
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Check
+        uses: competitive-verifier/actions/check@v2
+        with:
+          verify-result: ${{ steps.all-artifacts.outputs.artifacts-root }}/Result-*/result.json
+
+  deploy:
+    if: (success() || failure()) && github.ref == 'refs/heads/master' && needs.docs-and-check.outputs.upload-pages == 'true'
+    needs: docs-and-check
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
