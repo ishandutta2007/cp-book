@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import json
 import pathlib
-import re
 import sys
 
 
@@ -21,19 +20,6 @@ def details_page(coverage_dir: pathlib.Path, filename: str) -> str | None:
     digest = hashlib.md5(filename.encode()).hexdigest()
     name = f"index.{pathlib.PurePosixPath(filename).name}.{digest}.html"
     return name if (coverage_dir / name).exists() else None
-
-
-def ensure_title(page: pathlib.Path, filename: str) -> None:
-    """Set an explicit front matter title (the source path, matching the
-    default) so jekyll-titles-from-headings doesn't promote a body heading."""
-    content = page.read_text()
-    if not content.startswith("---\n"):
-        return
-    end = content.index("\n---", 4)
-    front_matter = content[4:end]
-    if re.search(r"^title\s*:", front_matter, re.MULTILINE):
-        return
-    page.write_text(f"---\ntitle: {json.dumps(filename)}\n{content[4:]}")
 
 
 def main() -> int:
@@ -61,7 +47,6 @@ def main() -> int:
             continue
         text = ", ".join(parts)
         body = f"[{text}]({link})" if link else text
-        ensure_title(page, filename)
         with page.open("a") as fp:
             fp.write(f"\n## Coverage\n\n{body}\n")
         count += 1
