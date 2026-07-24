@@ -129,6 +129,29 @@ TEMPLATE_TEST_CASE("FFT multiply sizes", "[fft]", ALL_ENGINES) {
 	}
 }
 
+TEMPLATE_TEST_CASE("transform add", "[fft]", MOD_ENGINES) {
+	// (a+b)*c via a transform-domain sum; for the inexact engines this exercises the
+	// scale-tracked transformed_t (add gives A=2, mul gives product<2>)
+	using E = TestType;
+	using num = typename E::value_type;
+	mt19937 mt(Catch::getSeed());
+	for (int n : {2, 16, 64}) {
+		vector<num> a(n), b(n), c(n);
+		fill_rnd(a, mt); fill_rnd(b, mt); fill_rnd(c, mt);
+		auto tab = E::add(E::transform(span<const num>(a), n), E::transform(span<const num>(b), n));
+		auto tc = E::transform(span<const num>(c), n);
+		vector<num> got(n);
+		E::finish(E::mul(tab, tc, n), span<num>(got));
+		vector<num> ab(n);
+		for (int i = 0; i < n; i++) ab[i] = a[i] + b[i];
+		auto want = multiply_slow(ab, c);
+		// compare mod x^n - 1 (circular)
+		for (int i = n; i < sz(want); i++) want[i - n] += want[i];
+		want.resize(n);
+		check_eq(got, want);
+	}
+}
+
 TEST_CASE("FFT double engine even/odd half", "[fft]") {
 	using E = fft_real_engine<double>;
 	mt19937 mt(Catch::getSeed());
@@ -564,7 +587,7 @@ TEST_CASE("poly reversed storage and series interop", "[fft]") {
 	auto mp = middle_product(cv, ca);
 	auto naive = [&](int j) {
 		num r{};
-		for (int d = 0; d < 37; d++) r += pa[d] * vals[j + d];
+		for (int t = 0; t < 37; t++) r += pa[t] * vals[j + t];
 		return r;
 	};
 	for (int j = 0; j < sz(mp); j++) REQUIRE(mp[size_t(j)] == naive(j));
@@ -702,6 +725,30 @@ TEMPLATE_TEST_CASE("online squarer", "[fft]", MOD_ENGINES) {
 			for (int i = n; i < 2*n; i++) {
 				REQUIRE(os.res[i] == slow[i]);
 			}
+		}
+	}
+}
+
+// marker engine: same ring, but declared non-commutative so the squarer
+// must take the multiplier path (no cross-term doubling)
+struct nc_engine : fft_engine<modnum<998244353>> {
+	static constexpr bool commutative = false;
+};
+static_assert(fft::conv_engine<nc_engine>);
+
+TEST_CASE("online squarer non-commutative fallback", "[fft]") {
+	using num = modnum<998244353>;
+	mt19937 mt(Catch::getSeed());
+	for (int n : {1, 2, 3, 17, 64, 100}) {
+		INFO("n = " << n);
+		vector<num> f(n);
+		fill_rnd(f, mt);
+		auto slow = multiply_slow(f, f);
+		slow.resize(2*n, num(0));
+		online_squarer<nc_engine> os(n);
+		for (int i = 0; i < n; i++) {
+			os.push(f[i]);
+			REQUIRE(os.back() == slow[i]);
 		}
 	}
 }
