@@ -150,6 +150,101 @@ TEMPLATE_TEST_CASE("transform add", "[fft]", MOD_ENGINES) {
 		want.resize(n);
 		check_eq(got, want);
 	}
+	// scale conversions: widening is implicit, narrowing is an explicit downcast
+	if constexpr (E::unit_scale != 0) {
+		using T1 = typename E::template transformed_t<1>;
+		using T2 = typename E::template transformed_t<2>;
+		STATIC_REQUIRE(std::is_convertible_v<T1&&, T2>);
+		STATIC_REQUIRE(!std::is_convertible_v<T2&&, T1>);
+		STATIC_REQUIRE(std::is_constructible_v<T1, T2&&>);
+		using P1 = typename E::template product_t<1>;
+		using P2 = typename E::template product_t<2>;
+		STATIC_REQUIRE(std::is_convertible_v<P1&&, P2>);
+		STATIC_REQUIRE(!std::is_convertible_v<P2&&, P1>);
+		STATIC_REQUIRE(std::is_constructible_v<P1, P2&&>);
+	}
+}
+
+template <typename E, bool online, int N>
+void test_matrix_engine(mt19937& mt) {
+	using M = typename E::value_type;
+	using num = std::remove_reference_t<decltype(std::declval<M&>()[{0, 0}])>;
+	auto rnd_mat = [&]() {
+		M m;
+		for (int r = 0; r < N; r++) for (int c = 0; c < N; c++) m[{r, c}] = rnd_val<num>(mt);
+		return m;
+	};
+	for (int la : {1, 2, 3, 17, 33}) {
+		for (int lb : {1, 2, 16, 17}) {
+			vector<M> a(la), b(lb);
+			for (M& m : a) m = rnd_mat();
+			for (M& m : b) m = rnd_mat();
+			INFO("la = " << la << ", lb = " << lb);
+			REQUIRE(multiply<E>(a, b) == multiply_slow(a, b));
+		}
+	}
+	// square of a matrix sequence must keep both cross orders
+	int n = 33;
+	vector<M> f(n);
+	for (M& m : f) m = rnd_mat();
+	auto slow = multiply_slow(f, f);
+	slow.resize(2*n, M{});
+	vector<M> got(2*n - 1);
+	square<E>(span<const M>(f), span<M>(got));
+	REQUIRE(got == vector<M>(slow.begin(), slow.begin() + 2*n - 1));
+	if constexpr (online) {
+		online_squarer<E> os(n);
+		for (int i = 0; i < n; i++) {
+			os.push(f[i]);
+			REQUIRE(os.back() == slow[i]);
+		}
+	}
+}
+
+TEMPLATE_TEST_CASE("matrix engine", "[fft]",
+		fft_engine<modnum<998244353>>,
+		fft_split_engine<modnum<int(1e9)+7>>,
+		crt_engine<modnum<int(1e9)+7>>) {
+	using IE = TestType;
+	// the tracked engines' scale budget admits N = 2 (entries are N-addend sums), and
+	// the non-commutative online squarer accumulates two N-addend products per window
+	// (scale 2N), exceeding it
+	constexpr int N = IE::unit_scale == 0 ? 3 : 2;
+	mt19937 mt(Catch::getSeed());
+	test_matrix_engine<matrix_engine<IE, N>, IE::unit_scale == 0, N>(mt);
+	// the stable variant works at any N (and its online squarer stays at scale 2)
+	test_matrix_engine<matrix_engine_stable<IE, 3>, true, 3>(mt);
+}
+
+template <typename E, typename num, int N>
+void test_trunc_series_engine(mt19937& mt) {
+	using P = typename E::value_type;
+	auto rnd_p = [&]() {
+		P p;
+		for (int i = 0; i < N; i++) p[i] = rnd_val<num>(mt);
+		return p;
+	};
+	for (int la : {1, 2, 3, 17, 33}) {
+		for (int lb : {1, 2, 16, 17}) {
+			vector<P> a(la), b(lb);
+			for (P& p : a) p = rnd_p();
+			for (P& p : b) p = rnd_p();
+			INFO("la = " << la << ", lb = " << lb);
+			REQUIRE(multiply<E>(a, b) == multiply_slow(a, b));
+		}
+	}
+}
+
+TEMPLATE_TEST_CASE("trunc_series engine", "[fft]",
+		fft_engine<modnum<998244353>>,
+		fft_split_engine<modnum<int(1e9)+7>>,
+		crt_engine<modnum<int(1e9)+7>>) {
+	using IE = TestType;
+	using num = typename IE::value_type;
+	constexpr int N = IE::unit_scale == 0 ? 3 : 2;
+	mt19937 mt(Catch::getSeed());
+	test_trunc_series_engine<trunc_series_engine<IE, N>, num, N>(mt);
+	test_trunc_series_engine<trunc_series_engine_stable<IE, 3>, num, 3>(mt);
 }
 
 TEST_CASE("FFT double engine even/odd half", "[fft]") {
